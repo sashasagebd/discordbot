@@ -1,7 +1,7 @@
 import { MessageFlags, type Client } from 'discord.js';
 import { getScoreboard, type LeagueKey, type Match } from './espn.js';
 import { formatGoal, formatGoals, scoreline, shootoutNote } from './format.js';
-import { getAllGuildSettings, type GuildSettings } from './store.js';
+import { getAllGuildSettings } from './store.js';
 
 // Check often while a followed match is live, and rarely otherwise.
 const LIVE_INTERVAL_MS = 30_000;
@@ -88,7 +88,13 @@ async function check(client: Client<true>): Promise<number> {
       const before = previous?.get(match.id);
       if (!before) continue;
       for (const update of describeChanges(before, match)) {
-        for (const [, settings] of followers) await post(client, settings, update);
+        for (const [, settings] of followers) {
+          // Ping the roles of whichever followed teams are playing (both, if they play each other).
+          const roleIds = settings.teams
+            .filter((t) => t.league === league && (t.id === match.home.id || t.id === match.away.id) && t.roleId)
+            .map((t) => t.roleId!);
+          await post(client, settings.channelId!, update, roleIds);
+        }
       }
     }
 
@@ -155,19 +161,20 @@ function describeChanges(before: Snapshot, match: Match): Update[] {
   return updates;
 }
 
-async function post(client: Client<true>, settings: GuildSettings, update: Update): Promise<void> {
+async function post(client: Client<true>, channelId: string, update: Update, roleIds: string[]): Promise<void> {
   try {
-    const channel = await client.channels.fetch(settings.channelId!);
+    const channel = await client.channels.fetch(channelId);
     if (!channel?.isSendable()) return;
 
-    const mention = update.ping && settings.roleId ? `<@&${settings.roleId}> ` : '';
+    const pinged = update.ping ? roleIds : [];
+    const mentions = pinged.map((id) => `<@&${id}> `).join('');
     await channel.send({
-      content: `${mention}${update.text}`,
-      allowedMentions: { roles: mention ? [settings.roleId!] : [] },
+      content: `${mentions}${update.text}`,
+      allowedMentions: { roles: pinged },
       flags: update.ping ? undefined : MessageFlags.SuppressNotifications,
     });
   } catch (error) {
     // Deleted channel, missing permissions, etc. Don't let one server block the others.
-    console.error(`Couldn't post sports update to channel ${settings.channelId}:`, error);
+    console.error(`Couldn't post sports update to channel ${channelId}:`, error);
   }
 }

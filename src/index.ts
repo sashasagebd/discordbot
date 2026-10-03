@@ -31,6 +31,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (interaction.isMessageComponent()) {
+    const commandName = interaction.customId.split(':')[0]!;
+    try {
+      await commands.get(commandName)?.handleComponent?.(interaction);
+    } catch (error) {
+      console.error(`Error handling ${interaction.customId}:`, error);
+      const message = { content: 'Something went wrong.', flags: MessageFlags.Ephemeral } as const;
+      if (interaction.replied || interaction.deferred) await interaction.followUp(message).catch(() => {});
+      else await interaction.reply(message).catch(() => {});
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const command = commands.get(interaction.commandName);

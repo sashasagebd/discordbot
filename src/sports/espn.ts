@@ -13,6 +13,7 @@ export interface Team {
   name: string;
   shortName: string;
   abbreviation: string;
+  color?: string; // Hex without the #, e.g. "5d9741"
 }
 
 export interface MatchSide {
@@ -49,6 +50,7 @@ interface RawTeam {
   displayName: string;
   shortDisplayName: string;
   abbreviation: string;
+  color?: string;
 }
 
 interface RawEvent {
@@ -139,6 +141,7 @@ export async function getTeams(league: LeagueKey): Promise<Team[]> {
     name: team.displayName,
     shortName: team.shortDisplayName,
     abbreviation: team.abbreviation,
+    color: team.color,
   }));
   teamsCache.set(league, { teams, fetchedAt: Date.now() });
   return teams;

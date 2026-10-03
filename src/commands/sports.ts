@@ -1,22 +1,40 @@
-import { ChannelType, InteractionContextType, MessageFlags, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
+import {
+  ChannelType,
+  InteractionContextType,
+  MessageFlags,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  type InteractionReplyOptions,
+} from 'discord.js';
 import type { Command } from '../types.js';
-import { getTeams, LEAGUES, type LeagueKey, type Team } from '../sports/espn.js';
+import { getTeams, LEAGUES, type LeagueKey } from '../sports/espn.js';
 import { matchTeams, resolveTeam } from '../sports/format.js';
 import { wakeAnnouncer } from '../sports/announcer.js';
-import { followTeam, getFollowedTeams, getGuildSettings, setAnnouncementChannel, unfollowTeam } from '../sports/store.js';
+import { allowChannel, joinTeam, leaveTeam, permissionHelp, removeTeamForEveryone } from '../sports/membership.js';
+import { buildRolePicker, handlePickerButton, isPickerButton, refreshRolePicker } from '../sports/rolePicker.js';
+import { getGuildSettings, setAnnouncementChannel, setRolePicker } from '../sports/store.js';
 
 // Only MLS for now. Adding a league means adding it to LEAGUES and a `league` option here.
 const LEAGUE: LeagueKey = 'mls';
 
+const textChannelTypes = [ChannelType.GuildText, ChannelType.GuildAnnouncement] as const;
+const ADMIN_SUBCOMMANDS = new Set(['setup', 'rolepicker', 'remove']);
+
+const ephemeral = (content: string): InteractionReplyOptions => ({
+  content,
+  flags: MessageFlags.Ephemeral,
+  allowedMentions: { parse: [] },
+});
+
 export default {
   data: new SlashCommandBuilder()
     .setName('sports')
-    .setDescription('Follow sports teams for score announcements.')
+    .setDescription('Follow MLS teams to get pinged for their goals.')
     .setContexts(InteractionContextType.Guild)
     .addSubcommand((sub) =>
       sub
         .setName('follow')
-        .setDescription('Follow an MLS team (needs Manage Server).')
+        .setDescription('Follow an MLS team: see the sports channel and get pinged for its goals.')
         .addStringOption((option) =>
           option.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true),
         ),
@@ -24,140 +42,233 @@ export default {
     .addSubcommand((sub) =>
       sub
         .setName('unfollow')
-        .setDescription('Stop following a team (needs Manage Server).')
+        .setDescription('Stop following a team.')
         .addStringOption((option) =>
           option.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true),
         ),
     )
+    .addSubcommand((sub) => sub.setName('list').setDescription('Show which teams people here follow.'))
     .addSubcommand((sub) =>
       sub
         .setName('setup')
-        .setDescription('Choose where announcements go and who gets pinged (needs Manage Server).')
+        .setDescription('Choose where announcements go (needs Manage Server).')
         .addChannelOption((option) =>
           option
             .setName('channel')
             .setDescription('Channel for match announcements')
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+            .addChannelTypes(...textChannelTypes)
             .setRequired(true),
         )
         .addRoleOption((option) =>
-          option.setName('role').setDescription('Role to ping for goals and full time (leave out for no pings)'),
+          option.setName('watch_role').setDescription('Role that can see the channel without getting pinged'),
         ),
     )
-    .addSubcommand((sub) => sub.setName('list').setDescription('Show the teams this server follows.')),
+    .addSubcommand((sub) =>
+      sub
+        .setName('rolepicker')
+        .setDescription('Post buttons for following the teams people here already follow (needs Manage Server).')
+        .addChannelOption((option) =>
+          option
+            .setName('channel')
+            .setDescription('Where to post it (defaults to this channel)')
+            .addChannelTypes(...textChannelTypes),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('remove')
+        .setDescription('Stop covering a team for everyone and delete its role (needs Manage Server).')
+        .addStringOption((option) =>
+          option.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true),
+        ),
+    ),
 
   async autocomplete(interaction) {
     if (!interaction.inGuild()) return;
     const query = interaction.options.getFocused();
+    const subcommand = interaction.options.getSubcommand();
 
-    let teams: Team[] | { id: string; name: string }[];
-    if (interaction.options.getSubcommand() === 'follow') {
-      teams = matchTeams(await getTeams(LEAGUE), query);
+    let choices: { id: string; name: string }[];
+    if (subcommand === 'follow') {
+      choices = matchTeams(await getTeams(LEAGUE), query);
     } else {
+      // unfollow: only your teams. remove: every team the server follows.
       const q = query.trim().toLowerCase();
-      teams = (await getFollowedTeams(interaction.guildId)).filter((t) => t.name.toLowerCase().includes(q));
+      choices = (await getGuildSettings(interaction.guildId)).teams.filter(
+        (t) =>
+          t.name.toLowerCase().includes(q) && (subcommand === 'remove' || t.memberIds.includes(interaction.user.id)),
+      );
     }
 
     // Discord allows at most 25 suggestions.
-    await interaction.respond(teams.slice(0, 25).map((t) => ({ name: t.name, value: t.id })));
+    await interaction.respond(choices.slice(0, 25).map((t) => ({ name: t.name, value: t.id })));
+  },
+
+  async handleComponent(interaction) {
+    if (interaction.isButton() && interaction.inCachedGuild() && isPickerButton(interaction.customId)) {
+      await handlePickerButton(interaction);
+    }
   },
 
   async execute(interaction) {
     if (!interaction.inCachedGuild()) return;
     const subcommand = interaction.options.getSubcommand();
+    const { guild, guildId, member } = interaction;
 
-    if (subcommand === 'list') {
-      const { teams, channelId, roleId } = await getGuildSettings(interaction.guildId);
-      const where = channelId
-        ? `Announcements go to <#${channelId}>${roleId ? ` and ping <@&${roleId}>` : ''}.`
-        : '⚠️ No announcement channel yet. Use `/sports setup` to choose one.';
-      await interaction.reply({
-        content:
-          teams.length === 0
-            ? `This server isn't following any teams yet. Use \`/sports follow\` to add one.\n${where}`
-            : `**Followed teams:**\n${teams.map((t) => `• ${t.name} (${LEAGUES[t.league].name})`).join('\n')}\n${where}`,
-        allowedMentions: { parse: [] },
-      });
+    if (ADMIN_SUBCOMMANDS.has(subcommand) && !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply(ephemeral('You need the **Manage Server** permission for that.'));
       return;
     }
 
-    if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
-      await interaction.reply({
-        content: 'You need the **Manage Server** permission to change sports settings.',
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
+    try {
+      if (subcommand === 'follow') {
+        let teams;
+        try {
+          teams = await getTeams(LEAGUE);
+        } catch (error) {
+          console.error('Could not load teams from ESPN:', error);
+          await interaction.reply(ephemeral("Couldn't reach ESPN right now. Try again in a moment."));
+          return;
+        }
 
-    if (subcommand === 'setup') {
-      const channel = interaction.options.getChannel('channel', true, [ChannelType.GuildText, ChannelType.GuildAnnouncement]);
-      const role = interaction.options.getRole('role');
-      const permissions = channel.permissionsFor(interaction.guild.members.me!);
+        const input = interaction.options.getString('team', true);
+        const team = resolveTeam(teams, input);
+        if (!team) {
+          await interaction.reply(
+            ephemeral(`Couldn't find an ${LEAGUES[LEAGUE].name} team matching \`${input}\`. Pick one from the suggestions.`),
+          );
+          return;
+        }
 
-      if (!permissions.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
-        await interaction.reply({
-          content: `I can't post in ${channel}. Give my role **View Channel** and **Send Messages** there, then try again.`,
-          flags: MessageFlags.Ephemeral,
-        });
+        // Creating a role and editing channel permissions can take a moment.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const result = await joinTeam(member, LEAGUE, team);
+        if (result.newTeam) {
+          wakeAnnouncer();
+          await refreshRolePicker(guild);
+        }
+
+        const { channelId } = await getGuildSettings(guildId);
+        const lines = [
+          result.alreadyFollowing
+            ? `You already follow **${team.name}**.`
+            : `✅ You're following **${team.name}**. You'll be pinged for its goals and full time${channelId ? ` in <#${channelId}>` : ''}.`,
+        ];
+        if (!channelId) lines.push('-# Announcements start once an admin picks a channel with `/sports setup`.');
+        if (!result.channelAccess) {
+          lines.push(`⚠️ I couldn't give ${result.role} access to <#${channelId}>. An admin needs to allow **View Channel** for it there.`);
+        }
+        await interaction.editReply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
         return;
       }
 
-      await setAnnouncementChannel(interaction.guildId, channel.id, role?.id);
-      wakeAnnouncer();
+      if (subcommand === 'unfollow') {
+        const input = interaction.options.getString('team', true);
+        const q = input.trim().toLowerCase();
+        const mine = (await getGuildSettings(guildId)).teams.filter((t) => t.memberIds.includes(member.id));
+        const team = mine.find((t) => t.id === input) ?? mine.find((t) => t.name.toLowerCase() === q);
+        if (!team) {
+          await interaction.reply(ephemeral(`You don't follow \`${input}\`. See \`/sports list\`.`));
+          return;
+        }
 
-      const cantPing =
-        role && !role.mentionable && !permissions.has(PermissionFlagsBits.MentionEveryone)
-          ? `\n⚠️ I can't ping ${role} yet. Either turn on **Allow anyone to @mention this role**, or give me **Mention @everyone, @here, and All Roles**.`
-          : '';
-      await interaction.reply({
-        content: `✅ Match announcements will go to ${channel}${role ? `, pinging ${role} for goals and full time` : ''}.${cantPing}`,
-        allowedMentions: { parse: [] },
-      });
-      return;
-    }
-
-    const input = interaction.options.getString('team', true);
-
-    if (subcommand === 'follow') {
-      let teams;
-      try {
-        teams = await getTeams(LEAGUE);
-      } catch (error) {
-        console.error('Could not load teams from ESPN:', error);
-        await interaction.reply({ content: "Couldn't reach ESPN right now. Try again in a moment.", flags: MessageFlags.Ephemeral });
+        const result = await leaveTeam(member, team.league, team.id);
+        if (result?.teamRemoved) await refreshRolePicker(guild);
+        await interaction.reply(ephemeral(`Unfollowed **${team.name}**.`));
         return;
       }
 
-      const team = resolveTeam(teams, input);
-      if (!team) {
-        await interaction.reply({
-          content: `Couldn't find an ${LEAGUES[LEAGUE].name} team matching \`${input}\`. Pick one from the suggestions.`,
-          flags: MessageFlags.Ephemeral,
-        });
+      if (subcommand === 'list') {
+        const { teams, channelId, watchRoleId } = await getGuildSettings(guildId);
+        const lines = [
+          teams.length
+            ? `**Teams followed here:**\n${teams
+                .map((t) => {
+                  const fans = `${t.memberIds.length} ${t.memberIds.length === 1 ? 'fan' : 'fans'}`;
+                  return `• ${t.name} — ${fans}${t.memberIds.includes(member.id) ? ' (including you)' : ''}`;
+                })
+                .join('\n')}`
+            : 'Nobody here follows a team yet. Use `/sports follow` to be the first.',
+          channelId ? `Announcements go to <#${channelId}>.` : '⚠️ No announcement channel yet (an admin can set one with `/sports setup`).',
+        ];
+        if (watchRoleId) lines.push(`Watch-only role: <@&${watchRoleId}>`);
+        await interaction.reply(ephemeral(lines.join('\n')));
         return;
       }
 
-      const added = await followTeam(interaction.guildId, { league: LEAGUE, id: team.id, name: team.name });
-      if (added) wakeAnnouncer();
-      const { channelId } = await getGuildSettings(interaction.guildId);
-      await interaction.reply(
-        added
-          ? `✅ Now following **${team.name}**.${channelId ? '' : '\nUse `/sports setup` to choose where announcements go.'}`
-          : { content: `Already following **${team.name}**.`, flags: MessageFlags.Ephemeral },
-      );
-      return;
-    }
+      if (subcommand === 'setup') {
+        const channel = interaction.options.getChannel('channel', true, [...textChannelTypes]);
+        const watchRole = interaction.options.getRole('watch_role');
+        const me = guild.members.me!;
 
-    if (subcommand === 'unfollow') {
-      const followed = await getFollowedTeams(interaction.guildId);
-      const q = input.trim().toLowerCase();
-      const team = followed.find((t) => t.id === input) ?? followed.find((t) => t.name.toLowerCase() === q);
-      const removed = team && (await unfollowTeam(interaction.guildId, team.league, team.id));
-      await interaction.reply(
-        removed
-          ? `Stopped following **${removed.name}**.`
-          : { content: `This server isn't following \`${input}\`. See \`/sports list\`.`, flags: MessageFlags.Ephemeral },
-      );
+        if (!channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+          await interaction.reply(ephemeral(`I can't post in ${channel}. Give my role **View Channel** and **Send Messages** there, then try again.`));
+          return;
+        }
+        if (watchRole && (watchRole.id === guildId || watchRole.managed)) {
+          await interaction.reply(ephemeral("Pick a normal role for watch-only, not @everyone or a bot's role."));
+          return;
+        }
+
+        await interaction.deferReply();
+        await setAnnouncementChannel(guildId, channel.id, watchRole?.id);
+
+        // Let every existing team role (and the watch-only role) see the new channel.
+        const { teams } = await getGuildSettings(guildId);
+        const roleIds = [...teams.map((t) => t.roleId), ...(watchRole ? [watchRole.id] : [])];
+        const results = await Promise.all(roleIds.map((id) => allowChannel(guild, channel.id, id)));
+        wakeAnnouncer();
+        await refreshRolePicker(guild);
+
+        const lines = [`✅ Match announcements will go to ${channel}.${watchRole ? ` Watch-only role: ${watchRole}.` : ''}`];
+        if (results.includes(false)) {
+          lines.push("⚠️ I couldn't give every team role access to the channel. Make sure I have **Manage Roles** and can see the channel.");
+        }
+        if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+          lines.push("⚠️ I don't have **Manage Roles**, so people can't follow teams yet.");
+        } else if (watchRole && me.roles.highest.comparePositionTo(watchRole) <= 0) {
+          lines.push(`⚠️ My role is below ${watchRole}, so I can't hand it out. Drag my role above it in Server Settings → Roles.`);
+        }
+        if (channel.permissionsFor(guild.roles.everyone).has(PermissionFlagsBits.ViewChannel)) {
+          lines.push(`-# Everyone can see ${channel} right now. To make it followers-only, deny **View Channel** for @everyone there.`);
+        }
+        await interaction.editReply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
+        return;
+      }
+
+      if (subcommand === 'rolepicker') {
+        const channel = interaction.options.getChannel('channel', false, [...textChannelTypes]) ?? interaction.channel;
+        if (!channel?.permissionsFor(guild.members.me!).has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+          await interaction.reply(ephemeral("I can't post in that channel."));
+          return;
+        }
+
+        const message = await channel.send(buildRolePicker(await getGuildSettings(guildId)));
+        // Only the newest picker is kept up to date. Buttons on older ones still work.
+        await setRolePicker(guildId, { channelId: channel.id, messageId: message.id });
+        await interaction.reply(ephemeral(`✅ Posted the role picker in ${channel}. It updates itself as teams are added or dropped.`));
+        return;
+      }
+
+      if (subcommand === 'remove') {
+        const input = interaction.options.getString('team', true);
+        const q = input.trim().toLowerCase();
+        const { teams } = await getGuildSettings(guildId);
+        const team = teams.find((t) => t.id === input) ?? teams.find((t) => t.name.toLowerCase() === q);
+        if (!team) {
+          await interaction.reply(ephemeral(`Nobody here follows \`${input}\`. See \`/sports list\`.`));
+          return;
+        }
+
+        await removeTeamForEveryone(guild, team);
+        await refreshRolePicker(guild);
+        await interaction.reply(ephemeral(`Removed **${team.name}** and its role. Anyone can follow it again later.`));
+      }
+    } catch (error) {
+      const help = permissionHelp(error);
+      if (!help) throw error;
+      if (interaction.deferred) await interaction.editReply(help);
+      else await interaction.reply(ephemeral(help));
     }
   },
 } satisfies Command;

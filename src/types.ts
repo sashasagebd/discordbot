@@ -1,6 +1,7 @@
 import type {
   AutocompleteInteraction,
   ChatInputCommandInteraction,
+  MessageComponentInteraction,
   RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from 'discord.js';
 
@@ -13,4 +14,6 @@ export interface Command {
   execute(interaction: ChatInputCommandInteraction): Promise<void>;
   // Only needed if an option uses setAutocomplete(true).
   autocomplete?(interaction: AutocompleteInteraction): Promise<void>;
+  // Handles buttons/menus whose custom ID starts with "<command name>:".
+  handleComponent?(interaction: MessageComponentInteraction): Promise<void>;
 }
