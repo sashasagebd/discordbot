@@ -1,4 +1,5 @@
 import type {
+  AutocompleteInteraction,
   ChatInputCommandInteraction,
   RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from 'discord.js';
@@ -10,4 +11,6 @@ export interface Command {
     toJSON(): RESTPostAPIChatInputApplicationCommandsJSONBody;
   };
   execute(interaction: ChatInputCommandInteraction): Promise<void>;
+  // Only needed if an option uses setAutocomplete(true).
+  autocomplete?(interaction: AutocompleteInteraction): Promise<void>;
 }

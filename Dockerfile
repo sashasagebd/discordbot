@@ -28,5 +28,8 @@ ENV NODE_ENV=production
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+# Saved bot settings (followed teams). Mounted as a volume in compose.yaml;
+# created here so the volume starts out owned by the node user.
+RUN mkdir -p /app/data && chown node:node /app/data
 USER node
 CMD ["node", "dist/index.js"]

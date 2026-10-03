@@ -2,6 +2,7 @@ import { Client, Events, GatewayIntentBits, MessageFlags } from 'discord.js';
 import { requireEnv } from './config.js';
 import { loadCommands } from './loadCommands.js';
 import { destroyAllQueues } from './music/queueManager.js';
+import { startAnnouncer, stopAnnouncer } from './sports/announcer.js';
 
 const client = new Client({
   intents: [
@@ -15,9 +16,21 @@ const commands = await loadCommands();
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag} with ${commands.size} command(s).`);
+  startAnnouncer(readyClient);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isAutocomplete()) {
+    const command = commands.get(interaction.commandName);
+    try {
+      await command?.autocomplete?.(interaction);
+    } catch (error) {
+      // No suggestions is fine; the user can still type the value.
+      console.error(`Error in autocomplete for /${interaction.commandName}:`, error);
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const command = commands.get(interaction.commandName);
@@ -43,6 +56,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     destroyAllQueues();
+    stopAnnouncer();
     void client.destroy().finally(() => process.exit(0));
   });
 }
