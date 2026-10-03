@@ -2,13 +2,21 @@
 // and response parsing live in this file in case it ever needs replacing.
 const BASE_URL = 'https://site.api.espn.com/apis/site/v2/sports';
 
+// `sport` decides how matches are announced and formatted (see announcer.ts and format.ts).
 export const LEAGUES = {
-  mls: { name: 'MLS', path: 'soccer/usa.1' },
+  mls: { name: 'MLS', path: 'soccer/usa.1', sport: 'soccer' },
+  nba: { name: 'NBA', path: 'basketball/nba', sport: 'basketball' },
 } as const;
 
 export type LeagueKey = keyof typeof LEAGUES;
+export const LEAGUE_KEYS = Object.keys(LEAGUES) as LeagueKey[];
+
+export function isLeagueKey(value: string): value is LeagueKey {
+  return value in LEAGUES;
+}
 
 export interface Team {
+  league: LeagueKey;
   id: string;
   name: string;
   shortName: string;
@@ -22,6 +30,7 @@ export interface MatchSide {
   abbreviation: string;
   score: number;
   winner: boolean;
+  topScorer?: { name: string; points: string }; // Basketball only.
 }
 
 export interface Goal {
@@ -33,15 +42,19 @@ export interface Goal {
 }
 
 export interface Match {
+  league: LeagueKey;
   id: string;
   kickoff: Date;
   state: 'pre' | 'in' | 'post';
-  statusName: string; // e.g. STATUS_FIRST_HALF, STATUS_HALFTIME, STATUS_FULL_TIME, STATUS_POSTPONED
-  statusDetail: string; // e.g. "45'+2'", "HT", "FT"
+  // e.g. STATUS_FIRST_HALF, STATUS_HALFTIME, STATUS_FULL_TIME (soccer),
+  // STATUS_IN_PROGRESS, STATUS_END_PERIOD, STATUS_FINAL (basketball), STATUS_POSTPONED
+  statusName: string;
+  statusDetail: string; // e.g. "45'+2'", "HT", "FT", "5:32 - 3rd", "Final"
   completed: boolean;
+  period: number; // Half or quarter; above 4 means overtime in basketball.
   home: MatchSide;
   away: MatchSide;
-  goals: Goal[]; // In order. Penalty shootout kicks aren't included.
+  goals: Goal[]; // Soccer only. In order; penalty shootout kicks aren't included.
   broadcasts: string[];
 }
 
@@ -57,7 +70,10 @@ interface RawEvent {
   id: string;
   date: string;
   competitions: {
-    status: { type: { name: string; state: Match['state']; completed: boolean; shortDetail: string } };
+    status: {
+      period?: number;
+      type: { name: string; state: Match['state']; completed: boolean; shortDetail: string };
+    };
     competitors: {
       id: string;
       homeAway: 'home' | 'away';
@@ -65,6 +81,7 @@ interface RawEvent {
       // A string on the scoreboard, an object on team schedules, missing before kickoff.
       score?: string | { displayValue: string };
       team: RawTeam;
+      leaders?: { name: string; leaders: { displayValue: string; athlete: { displayName: string } }[] }[];
     }[];
     details?: {
       scoringPlay: boolean;
@@ -86,27 +103,31 @@ async function getJson<T>(url: string, timeoutMs: number): Promise<T> {
   return (await response.json()) as T;
 }
 
-function parseMatch(event: RawEvent): Match {
+function parseMatch(league: LeagueKey, event: RawEvent): Match {
   const competition = event.competitions[0]!;
   const side = (homeAway: 'home' | 'away'): MatchSide => {
     const c = competition.competitors.find((c) => c.homeAway === homeAway)!;
     const score = typeof c.score === 'object' ? c.score.displayValue : c.score;
+    const points = c.leaders?.find((l) => l.name === 'points')?.leaders[0];
     return {
       id: c.id,
       name: c.team.displayName,
       abbreviation: c.team.abbreviation,
       score: Number(score) || 0,
       winner: c.winner ?? false,
+      topScorer: points && { name: points.athlete.displayName, points: points.displayValue },
     };
   };
 
   return {
+    league,
     id: event.id,
     kickoff: new Date(event.date),
     state: competition.status.type.state,
     statusName: competition.status.type.name,
     statusDetail: competition.status.type.shortDetail,
     completed: competition.status.type.completed,
+    period: competition.status.period ?? 0,
     home: side('home'),
     away: side('away'),
     goals: (competition.details ?? [])
@@ -137,6 +158,7 @@ export async function getTeams(league: LeagueKey): Promise<Team[]> {
     2500,
   );
   const teams = (body.sports[0]?.leagues[0]?.teams ?? []).map(({ team }) => ({
+    league,
     id: team.id,
     name: team.displayName,
     shortName: team.shortDisplayName,
@@ -147,10 +169,18 @@ export async function getTeams(league: LeagueKey): Promise<Team[]> {
   return teams;
 }
 
+// Teams from every league. A league that fails to load is left out rather than failing the lot.
+export async function getAllTeams(): Promise<Team[]> {
+  const results = await Promise.allSettled(LEAGUE_KEYS.map(getTeams));
+  const teams = results.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
+  if (teams.length === 0) throw new Error('Could not load teams for any league');
+  return teams;
+}
+
 // Today's matches (ESPN's "today" follows US Eastern time).
 export async function getScoreboard(league: LeagueKey, timeoutMs = 2500): Promise<Match[]> {
   const body = await getJson<{ events: RawEvent[] }>(`${BASE_URL}/${LEAGUES[league].path}/scoreboard`, timeoutMs);
-  return body.events.map(parseMatch);
+  return body.events.map((e) => parseMatch(league, e));
 }
 
 // This season's matches that have already been played.
@@ -159,7 +189,7 @@ export async function getTeamResults(league: LeagueKey, teamId: string, timeoutM
     `${BASE_URL}/${LEAGUES[league].path}/teams/${teamId}/schedule`,
     timeoutMs,
   );
-  return (body.events ?? []).map(parseMatch).filter((m) => m.state === 'post');
+  return (body.events ?? []).map((e) => parseMatch(league, e)).filter((m) => m.state === 'post');
 }
 
 export async function getNextMatch(league: LeagueKey, teamId: string, timeoutMs = 2500): Promise<Match | undefined> {
@@ -168,5 +198,5 @@ export async function getNextMatch(league: LeagueKey, teamId: string, timeoutMs 
     timeoutMs,
   );
   const next = body.team.nextEvent?.[0];
-  return next && parseMatch(next);
+  return next && parseMatch(league, next);
 }

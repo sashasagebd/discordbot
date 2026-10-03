@@ -9,7 +9,7 @@ import {
   type Guild,
   type MessageCreateOptions,
 } from 'discord.js';
-import { getTeams, type LeagueKey } from './espn.js';
+import { getTeams, isLeagueKey, type LeagueKey } from './espn.js';
 import { joinTeam, leaveTeam, permissionHelp } from './membership.js';
 import { getGuildSettings, setRolePicker, type GuildSettings } from './store.js';
 
@@ -34,7 +34,7 @@ export function buildRolePicker(settings: GuildSettings): MessageCreateOptions {
   }
 
   const content =
-    `**Pick your teams**\nClick a team to see ${channel} and get pinged for its goals and full time. Click it again to unfollow.\n` +
+    `**Pick your teams**\nClick a team to see ${channel} and get pinged for its games. Click it again to unfollow.\n` +
     `-# Team not listed? Use \`/sports follow\` to add it.`;
   return { content, components: rows, allowedMentions: { parse: [] } };
 }
@@ -94,12 +94,12 @@ async function toggleTeam(interaction: ButtonInteraction<'cached'>, reply: Reply
 
   // The button can outlive the team (if everyone unfollowed it), so look it up
   // again rather than trusting the label.
-  const team = (await getTeams(league)).find((t) => t.id === teamId);
+  const team = isLeagueKey(league) ? (await getTeams(league)).find((t) => t.id === teamId) : undefined;
   if (!team) {
     await reply('That team is no longer available.');
     return;
   }
-  const result = await joinTeam(member, league, team);
+  const result = await joinTeam(member, team);
   await reply(`✅ You're following **${team.name}**.${settings.channelId ? ` Updates are in <#${settings.channelId}>.` : ''}`);
   if (result.newTeam) await refreshRolePicker(interaction.guild);
 }

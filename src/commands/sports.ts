@@ -7,15 +7,12 @@ import {
   type InteractionReplyOptions,
 } from 'discord.js';
 import type { Command } from '../types.js';
-import { getTeams, LEAGUES, type LeagueKey } from '../sports/espn.js';
-import { matchTeams, resolveTeam } from '../sports/format.js';
+import { getAllTeams } from '../sports/espn.js';
+import { matchTeams, pingSummary, resolveTeam, teamLabel, teamValue } from '../sports/format.js';
 import { wakeAnnouncer } from '../sports/announcer.js';
 import { allowChannel, joinTeam, leaveTeam, permissionHelp, removeTeamForEveryone } from '../sports/membership.js';
 import { buildRolePicker, handlePickerButton, isPickerButton, refreshRolePicker } from '../sports/rolePicker.js';
 import { getGuildSettings, setAnnouncementChannel, setRolePicker } from '../sports/store.js';
-
-// Only MLS for now. Adding a league means adding it to LEAGUES and a `league` option here.
-const LEAGUE: LeagueKey = 'mls';
 
 const textChannelTypes = [ChannelType.GuildText, ChannelType.GuildAnnouncement] as const;
 const ADMIN_SUBCOMMANDS = new Set(['setup', 'rolepicker', 'remove']);
@@ -29,12 +26,12 @@ const ephemeral = (content: string): InteractionReplyOptions => ({
 export default {
   data: new SlashCommandBuilder()
     .setName('sports')
-    .setDescription('Follow MLS teams to get pinged for their goals.')
+    .setDescription('Follow MLS and NBA teams to get pinged for their games.')
     .setContexts(InteractionContextType.Guild)
     .addSubcommand((sub) =>
       sub
         .setName('follow')
-        .setDescription('Follow an MLS team: see the sports channel and get pinged for its goals.')
+        .setDescription('Follow an MLS or NBA team: see the sports channel and get pinged for its games.')
         .addStringOption((option) =>
           option.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true),
         ),
@@ -88,20 +85,20 @@ export default {
     const query = interaction.options.getFocused();
     const subcommand = interaction.options.getSubcommand();
 
-    let choices: { id: string; name: string }[];
+    let choices;
     if (subcommand === 'follow') {
-      choices = matchTeams(await getTeams(LEAGUE), query);
+      choices = matchTeams(await getAllTeams(), query);
     } else {
       // unfollow: only your teams. remove: every team the server follows.
-      const q = query.trim().toLowerCase();
-      choices = (await getGuildSettings(interaction.guildId)).teams.filter(
-        (t) =>
-          t.name.toLowerCase().includes(q) && (subcommand === 'remove' || t.memberIds.includes(interaction.user.id)),
+      const { teams } = await getGuildSettings(interaction.guildId);
+      choices = matchTeams(
+        teams.filter((t) => subcommand === 'remove' || t.memberIds.includes(interaction.user.id)),
+        query,
       );
     }
 
     // Discord allows at most 25 suggestions.
-    await interaction.respond(choices.slice(0, 25).map((t) => ({ name: t.name, value: t.id })));
+    await interaction.respond(choices.slice(0, 25).map((t) => ({ name: teamLabel(t), value: teamValue(t) })));
   },
 
   async handleComponent(interaction) {
@@ -124,7 +121,7 @@ export default {
       if (subcommand === 'follow') {
         let teams;
         try {
-          teams = await getTeams(LEAGUE);
+          teams = await getAllTeams();
         } catch (error) {
           console.error('Could not load teams from ESPN:', error);
           await interaction.reply(ephemeral("Couldn't reach ESPN right now. Try again in a moment."));
@@ -135,14 +132,14 @@ export default {
         const team = resolveTeam(teams, input);
         if (!team) {
           await interaction.reply(
-            ephemeral(`Couldn't find an ${LEAGUES[LEAGUE].name} team matching \`${input}\`. Pick one from the suggestions.`),
+            ephemeral(`Couldn't find a single team matching \`${input}\`. Pick one from the suggestions.`),
           );
           return;
         }
 
         // Creating a role and editing channel permissions can take a moment.
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const result = await joinTeam(member, LEAGUE, team);
+        const result = await joinTeam(member, team);
         if (result.newTeam) {
           wakeAnnouncer();
           await refreshRolePicker(guild);
@@ -152,7 +149,7 @@ export default {
         const lines = [
           result.alreadyFollowing
             ? `You already follow **${team.name}**.`
-            : `✅ You're following **${team.name}**. You'll be pinged for its goals and full time${channelId ? ` in <#${channelId}>` : ''}.`,
+            : `✅ You're following **${teamLabel(team)}**. You'll be pinged for ${pingSummary(team.league)}${channelId ? ` in <#${channelId}>` : ''}.`,
         ];
         if (!channelId) lines.push('-# Announcements start once an admin picks a channel with `/sports setup`.');
         if (!result.channelAccess) {
@@ -164,9 +161,8 @@ export default {
 
       if (subcommand === 'unfollow') {
         const input = interaction.options.getString('team', true);
-        const q = input.trim().toLowerCase();
         const mine = (await getGuildSettings(guildId)).teams.filter((t) => t.memberIds.includes(member.id));
-        const team = mine.find((t) => t.id === input) ?? mine.find((t) => t.name.toLowerCase() === q);
+        const team = resolveTeam(mine, input);
         if (!team) {
           await interaction.reply(ephemeral(`You don't follow \`${input}\`. See \`/sports list\`.`));
           return;
@@ -185,7 +181,7 @@ export default {
             ? `**Teams followed here:**\n${teams
                 .map((t) => {
                   const fans = `${t.memberIds.length} ${t.memberIds.length === 1 ? 'fan' : 'fans'}`;
-                  return `• ${t.name} — ${fans}${t.memberIds.includes(member.id) ? ' (including you)' : ''}`;
+                  return `• ${teamLabel(t)} — ${fans}${t.memberIds.includes(member.id) ? ' (including you)' : ''}`;
                 })
                 .join('\n')}`
             : 'Nobody here follows a team yet. Use `/sports follow` to be the first.',
@@ -252,9 +248,7 @@ export default {
 
       if (subcommand === 'remove') {
         const input = interaction.options.getString('team', true);
-        const q = input.trim().toLowerCase();
-        const { teams } = await getGuildSettings(guildId);
-        const team = teams.find((t) => t.id === input) ?? teams.find((t) => t.name.toLowerCase() === q);
+        const team = resolveTeam((await getGuildSettings(guildId)).teams, input);
         if (!team) {
           await interaction.reply(ephemeral(`Nobody here follows \`${input}\`. See \`/sports list\`.`));
           return;

@@ -18,8 +18,9 @@ export interface JoinResult {
   channelAccess: boolean; // false if the role couldn't be given access to the channel.
 }
 
-export function joinTeam(member: GuildMember, league: LeagueKey, team: Team): Promise<JoinResult> {
+export function joinTeam(member: GuildMember, team: Team): Promise<JoinResult> {
   const { guild } = member;
+  const { league } = team;
   return withGuildLock(guild.id, async () => {
     const settings = await getGuildSettings(guild.id);
     const existing = settings.teams.find((t) => t.league === league && t.id === team.id);
