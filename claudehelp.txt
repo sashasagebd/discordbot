@@ -1,0 +1,2 @@
+/clear for switching tasks
+/compact for shrinking session down to summary
